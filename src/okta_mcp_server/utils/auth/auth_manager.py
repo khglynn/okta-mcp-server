@@ -21,6 +21,7 @@ import requests
 from loguru import logger
 
 SERVICE_NAME = "OktaAuthManager"
+TOKEN_EXPIRY_BUFFER_SECONDS = 300
 
 
 @dataclass
@@ -33,6 +34,7 @@ class OktaAuthManager:
     scopes: str = "openid profile email offline_access"
     private_key: str = field(init=False, default=None)
     key_id: str = field(init=False, default=None)
+    required_api_scopes: set[str] = field(init=False, default_factory=set)
     use_browserless_auth: bool = field(init=False, default=False)
 
     # TODO: Implement a way to set scopes dynamically by the user if needed.
@@ -42,7 +44,9 @@ class OktaAuthManager:
         logger.debug("Initializing OktaAuthManager")
         self.org_url = os.environ.get("OKTA_ORG_URL")
         self.client_id = os.environ.get("OKTA_CLIENT_ID")
-        self.scopes = f"{self.scopes} {os.environ.get('OKTA_SCOPES', '').strip()}"
+        okta_scopes = os.environ.get("OKTA_SCOPES", "").strip()
+        self.required_api_scopes = set(okta_scopes.split())
+        self.scopes = f"{self.scopes} {okta_scopes}"
 
         # Check for browserless auth configuration
         self.private_key = os.environ.get("OKTA_PRIVATE_KEY")
@@ -282,6 +286,91 @@ class OktaAuthManager:
             logger.error(f"Error during token refresh: {e}")
             return False
 
+    def _get_cached_access_token_expiry(self, api_token: str) -> int | None:
+        """Return the cached access token expiry timestamp when the token is a JWT."""
+        try:
+            decoded = jwt.decode(api_token, options={"verify_signature": False, "verify_exp": False})
+        except jwt.PyJWTError as e:
+            logger.debug(f"Cached access token expiry could not be decoded: {e}")
+            return None
+
+        expires_at = decoded.get("exp")
+        if isinstance(expires_at, int):
+            return expires_at
+
+        logger.debug("Cached access token did not include a numeric exp claim")
+        return None
+
+    def _get_cached_access_token_scopes(self, api_token: str) -> set[str] | None:
+        """Return OAuth scopes from a cached JWT access token when present."""
+        try:
+            decoded = jwt.decode(api_token, options={"verify_signature": False, "verify_exp": False})
+        except jwt.PyJWTError as e:
+            logger.debug(f"Cached access token scopes could not be decoded: {e}")
+            return None
+
+        scopes = decoded.get("scp")
+        if isinstance(scopes, list):
+            return {scope for scope in scopes if isinstance(scope, str)}
+
+        scopes = decoded.get("scope")
+        if isinstance(scopes, str):
+            return set(scopes.split())
+
+        logger.debug("Cached access token did not include a readable scope claim")
+        return None
+
+    def _has_valid_cached_access_token(self, expiry_duration: int = 3600) -> bool:
+        """Check whether the keyring has an access token that can be reused."""
+        api_token = keyring.get_password(SERVICE_NAME, "api_token")
+        if not api_token:
+            logger.info("No cached Okta access token found")
+            return False
+
+        expires_at = self._get_cached_access_token_expiry(api_token)
+        now = int(time.time())
+        if expires_at is not None:
+            seconds_remaining = expires_at - now
+            if seconds_remaining > TOKEN_EXPIRY_BUFFER_SECONDS:
+                token_scopes = self._get_cached_access_token_scopes(api_token)
+                if token_scopes is not None and not self.required_api_scopes.issubset(token_scopes):
+                    missing_scopes = sorted(self.required_api_scopes - token_scopes)
+                    logger.info(f"Cached Okta access token is missing configured scope(s): {missing_scopes}")
+                    return False
+
+                logger.info(f"Using cached Okta access token; expires in {seconds_remaining}s")
+                self.token_timestamp = now
+                return True
+
+            logger.info(f"Cached Okta access token expires too soon ({seconds_remaining}s remaining)")
+            return False
+
+        token_age = time.time() - self.token_timestamp
+        if self.token_timestamp and token_age < expiry_duration:
+            logger.info(f"Using cached Okta access token based on process timestamp (age: {token_age:.0f}s)")
+            return True
+
+        logger.info("Cached Okta access token has no readable expiry; refreshing")
+        return False
+
+    async def ensure_authenticated(self, expiry_duration: int = 3600) -> bool:
+        """Ensure a reusable token exists before opening an interactive auth flow."""
+        logger.debug(f"Ensuring Okta token is available (expiry duration: {expiry_duration}s)")
+
+        if self._has_valid_cached_access_token(expiry_duration=expiry_duration):
+            return True
+
+        if self.use_browserless_auth:
+            logger.info("Cached token missing or expired; using browserless authentication")
+            await self.authenticate()
+        else:
+            refreshed = self.refresh_access_token()
+            if not refreshed:
+                logger.warning("No reusable Okta token available; starting device authorization")
+                await self.authenticate()
+
+        return keyring.get_password(SERVICE_NAME, "api_token") is not None
+
     async def authenticate(self):
         """Perform full authentication using the appropriate flow."""
         if self.use_browserless_auth:
@@ -318,30 +407,7 @@ class OktaAuthManager:
 
     async def is_valid_token(self, expiry_duration: int = 3600) -> bool:
         """Ensure that a valid token is available. Refresh or re-authenticate if needed."""
-        logger.debug(f"Checking token validity (expiry duration: {expiry_duration}s)")
-
-        api_token = keyring.get_password(SERVICE_NAME, "api_token")
-        token_age = time.time() - self.token_timestamp
-
-        if api_token and token_age < expiry_duration:
-            logger.debug(f"Token is valid (age: {token_age:.0f}s)")
-            return True
-
-        logger.info(f"Token is expired or missing (age: {token_age:.0f}s)")
-        if self.use_browserless_auth:
-            # For browserless auth, we can't refresh, so re-authenticate
-            logger.info("Re-authenticating using browserless flow")
-            await self.authenticate()
-        else:
-            # For device flow, try to refresh first
-            refreshed = self.refresh_access_token()
-
-            # If refresh token is not available or refresh failed, re-authenticate
-            if not refreshed:
-                logger.warning("Token refresh failed, initiating re-authentication")
-                await self.authenticate()
-
-        return keyring.get_password(SERVICE_NAME, "api_token") is not None
+        return await self.ensure_authenticated(expiry_duration=expiry_duration)
 
     def clear_tokens(self):
         """Clear all stored tokens from keyring."""

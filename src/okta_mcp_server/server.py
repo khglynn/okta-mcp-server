@@ -33,15 +33,14 @@ async def okta_authorisation_flow(server: FastMCP) -> AsyncIterator[OktaAppConte
     """
     logger.info("Starting Okta authorization flow")
     manager = OktaAuthManager()
-    await manager.authenticate()
+    await manager.ensure_authenticated()
     logger.info("Okta authentication completed successfully")
     prune_tools_by_scope(server, manager)
 
     try:
         yield OktaAppContext(okta_auth_manager=manager)
     finally:
-        logger.debug("Clearing Okta tokens")
-        manager.clear_tokens()
+        logger.debug("Leaving cached Okta tokens in keyring for future MCP sessions")
 
 
 mcp = FastMCP("Okta IDaaS MCP Server", lifespan=okta_authorisation_flow)
