@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import jwt
 import keyring
+import keyring.errors
 import pytest
 
 from okta_mcp_server.utils.auth.auth_manager import SERVICE_NAME, OktaAuthManager
@@ -115,3 +116,42 @@ async def test_ensure_authenticated_opens_device_flow_only_when_refresh_fails(mo
     assert await manager.ensure_authenticated()
     manager.refresh_access_token.assert_called_once_with()
     manager.authenticate.assert_awaited_once_with()
+
+
+# A second copy of the server writing the same keyring item at the same moment (Claude Desktop
+# starts one for chat and one for the shared Cowork/Code pool) must not crash startup.
+# macOS reports that collision as errSecDuplicateItem (-25299). Added 2026-09-23.
+
+def test_store_secret_retries_a_concurrent_write_collision(monkeypatch):
+    from okta_mcp_server.utils.auth import auth_manager
+
+    calls = []
+
+    def flaky_set(service, key, value):
+        calls.append((service, key, value))
+        if len(calls) == 1:
+            raise keyring.errors.PasswordSetError("Can't store password on keychain: (-25299, 'Unknown Error')")
+
+    monkeypatch.setattr(keyring, "set_password", flaky_set)
+    monkeypatch.setattr(auth_manager.time, "sleep", lambda s: None)
+
+    auth_manager._store_secret("api_token", "tok")
+
+    assert calls == [(SERVICE_NAME, "api_token", "tok")] * 2
+
+
+def test_store_secret_gives_up_quietly_when_every_write_collides(monkeypatch):
+    from okta_mcp_server.utils.auth import auth_manager
+
+    calls = []
+
+    def always_collides(service, key, value):
+        calls.append(key)
+        raise keyring.errors.PasswordSetError("(-25299, 'Unknown Error')")
+
+    monkeypatch.setattr(keyring, "set_password", always_collides)
+    monkeypatch.setattr(auth_manager.time, "sleep", lambda s: None)
+
+    auth_manager._store_secret("refresh_token", "r")  # must not raise
+
+    assert calls == ["refresh_token"] * 3
