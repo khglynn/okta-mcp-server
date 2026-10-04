@@ -107,6 +107,41 @@ class TestIsValidToken:
         mock_auth.assert_awaited_once()
 
     @pytest.mark.asyncio
+    @patch("okta_mcp_server.utils.auth.auth_manager.time.sleep")
+    @patch("okta_mcp_server.utils.auth.auth_manager.requests.post")
+    @patch("okta_mcp_server.utils.auth.auth_manager.keyring")
+    async def test_concurrent_keyring_write_during_refresh_does_not_crash_startup(
+        self, mock_keyring, mock_post, _mock_sleep
+    ):
+        # Two servers starting together both refresh an expired token and write it at once.
+        # macOS keyring replaces an item by delete-then-add, so the slower writer gets
+        # errSecDuplicateItem (-25299). Startup must survive it and keep the fresh token.
+        store = {"api_token": _jwt_with_exp(-60), "refresh_token": "refresh-abc"}
+        collisions = [keyring.errors.PasswordSetError("Can't store password on keychain: (-25299, 'Unknown Error')")]
+
+        def _set_password(_service, key, value):
+            if collisions:
+                raise collisions.pop()
+            store[key] = value
+
+        mock_keyring.get_password.side_effect = lambda _service, key: store.get(key)
+        mock_keyring.set_password.side_effect = _set_password
+        mock_keyring.errors.PasswordSetError = keyring.errors.PasswordSetError
+
+        new_token = _jwt_with_exp(3600)
+        mock_post.return_value = MagicMock(
+            status_code=200, json=MagicMock(return_value={"access_token": new_token, "refresh_token": "refresh-def"})
+        )
+
+        manager = OktaAuthManager()
+        with patch.object(OktaAuthManager, "authenticate", new=AsyncMock()) as mock_auth:
+            result = await manager.is_valid_token()
+
+        assert result is True
+        mock_auth.assert_not_called()
+        assert store == {"api_token": new_token, "refresh_token": "refresh-def"}
+
+    @pytest.mark.asyncio
     @patch("okta_mcp_server.utils.auth.auth_manager.keyring")
     async def test_no_cached_token_triggers_device_flow(self, mock_keyring):
         mock_keyring.get_password.side_effect = _keyring_returns(api_token=None, refresh_token=None)
