@@ -17,11 +17,34 @@ from dataclasses import dataclass, field
 import jwt
 import keyring
 import keyring.backend
+import keyring.errors
 import requests
 from loguru import logger
 
 SERVICE_NAME = "OktaAuthManager"
 _TOKEN_EXPIRY_SAFETY_MARGIN_SECONDS = 60
+
+
+def _store_secret(key: str, value: str) -> None:
+    """Write a token to the keyring, tolerating another copy of this server writing it too.
+
+    macOS keyring replaces an item by delete-then-add, so two servers refreshing at the same
+    moment can make the slower one fail with errSecDuplicateItem (-25299). The item the other
+    copy just wrote is equally fresh, so retry briefly, then carry on with a warning.
+    """
+    for attempt in range(3):
+        try:
+            keyring.set_password(SERVICE_NAME, key, value)
+            return
+        except keyring.errors.PasswordSetError as e:
+            if attempt == 2:
+                logger.warning(
+                    f"Could not store {key} in the keyring after 3 tries ({e}); "
+                    "another copy of the server most likely stored a fresh one"
+                )
+                return
+            time.sleep(0.2 * (attempt + 1))
+
 
 @dataclass
 class OktaAuthManager:
@@ -136,7 +159,7 @@ class OktaAuthManager:
 
                 if access_token:
                     logger.info("Successfully obtained access token via browserless authentication")
-                    keyring.set_password(SERVICE_NAME, "api_token", access_token)
+                    _store_secret("api_token", access_token)
 
                     # Note: Client credentials flow doesn't provide refresh tokens
                     logger.debug("Note: Client credentials flow does not provide refresh tokens")
@@ -208,11 +231,11 @@ class OktaAuthManager:
 
                 if response.status_code == 200 and "access_token" in resp_json:
                     logger.info("Successfully obtained access token")
-                    keyring.set_password(SERVICE_NAME, "api_token", resp_json["access_token"])
+                    _store_secret("api_token", resp_json["access_token"])
 
                     if "refresh_token" in resp_json:
                         logger.debug("Refresh token received and stored")
-                        keyring.set_password(SERVICE_NAME, "refresh_token", resp_json["refresh_token"])
+                        _store_secret("refresh_token", resp_json["refresh_token"])
 
                     return resp_json["access_token"]
 
@@ -262,11 +285,11 @@ class OktaAuthManager:
 
             if response.status_code == 200:
                 resp_json = response.json()
-                keyring.set_password(SERVICE_NAME, "api_token", resp_json["access_token"])
+                _store_secret("api_token", resp_json["access_token"])
 
                 if "refresh_token" in resp_json:
                     logger.debug("New refresh token received and stored")
-                    keyring.set_password(SERVICE_NAME, "refresh_token", resp_json["refresh_token"])
+                    _store_secret("refresh_token", resp_json["refresh_token"])
 
                 logger.info("Token refreshed successfully")
                 return True
