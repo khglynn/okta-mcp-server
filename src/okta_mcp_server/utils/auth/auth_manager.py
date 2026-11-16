@@ -21,7 +21,17 @@ import keyring.errors
 import requests
 from loguru import logger
 
-SERVICE_NAME = "OktaAuthManager"
+# Which keyring entry holds this server's sign-in. One entry serves every copy of the server on a
+# machine by default. A machine that runs the server as two identities (Lamplight, 2026-11-15: Kevin's
+# own sign-in in one Claude profile and ai@tecovas.com's in another) gives each registration its own
+# name through OKTA_KEYRING_SERVICE, so one identity's sign-in is never used as the other's. Only
+# letters, digits, "-" and "_" are taken; anything else falls back to the default.
+_KEYRING_SUFFIX = os.environ.get("OKTA_KEYRING_SERVICE", "").strip()
+SERVICE_NAME = (
+    _KEYRING_SUFFIX
+    if _KEYRING_SUFFIX and all(c.isalnum() or c in "-_" for c in _KEYRING_SUFFIX)
+    else "OktaAuthManager"
+)
 _TOKEN_EXPIRY_SAFETY_MARGIN_SECONDS = 60
 
 
